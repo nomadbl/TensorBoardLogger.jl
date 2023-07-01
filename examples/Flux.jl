@@ -1,10 +1,9 @@
 #For a Colab of this example, goto https://colab.research.google.com/drive/1xfUsBn9GEqbRjBF-UX_jnGjHZNtNsMae
 using TensorBoardLogger
-using Flux
+using Flux, ChainRulesCore
 using Logging
 using MLDatasets
 using Statistics
-using CuArrays
 
 #create tensorboard logger
 logdir = "content/log"
@@ -28,62 +27,49 @@ model = Chain(
     Dense(28^2, 32, relu),
     Dense(32, 10),
     softmax
-)
+) |> gpu
 
-loss(x, y) = Flux.crossentropy(model(x), y)
+loss_fn(pred, y) = Flux.crossentropy(pred, y)
 
-accuracy(x, y) = mean(Flux.onecold(model(x) |> cpu) .== Flux.onecold(y |> cpu))
+accuracy(pred, y) = mean(Flux.onecold(pred |> cpu) .== Flux.onecold(y |> cpu))
 
-opt = ADAM()
+opt = Flux.setup(ADAM(), model)
 
-traindata = permutedims(reshape(traindata, (28, 28, 60000, 1)), (1, 2, 4, 3));
-testdata = permutedims(reshape(testdata, (28, 28, 10000, 1)), (1, 2, 4, 3));
+traindata = reshape(traindata, (28, 28, 1, 60000));
+testdata = reshape(testdata, (28, 28, 1, 10000));
 trainlabels = Flux.onehotbatch(trainlabels, collect(0:9));
 testlabels = Flux.onehotbatch(testlabels, collect(0:9));
 
-#function to get dictionary of model parameters
-function fill_param_dict!(dict, m, prefix)
-    if m isa Chain
-        for (i, layer) in enumerate(m.layers)
-            fill_param_dict!(dict, layer, prefix*"layer_"*string(i)*"/"*string(layer)*"/")
-        end
-    else
-        for fieldname in fieldnames(typeof(m))
-            val = getfield(m, fieldname)
-            if val isa AbstractArray
-                val = vec(val)
-            end
-            dict[prefix*string(fieldname)] = val
-        end
-    end
+#functions to log information
+function log_train(pred, y)
+    @info "train" loss=loss_fn(pred, y) acc=accuracy(pred, y)
+end
+function log_val()
+    params_vec, _ = Flux.destructure(model)
+        @info "train" model=params_vec log_step_increment=0
+    @info "test" loss=loss_fn(model(testdata), testlabels) acc=accuracy(model(testdata), testlabels)
 end
 
-#function to log information after every epoch
-function TBCallback()
-  param_dict = Dict{String, Any}()
-  fill_param_dict!(param_dict, model, "")
-  with_logger(logger) do
-    @info "model" params=param_dict log_step_increment=0
-    @info "train" loss=loss(traindata, trainlabels) acc=accuracy(traindata, trainlabels) log_step_increment=0
-    @info "test" loss=loss(testdata, testlabels) acc=accuracy(testdata, testlabels)
-  end
-end
+# trainloader = Flux.DataLoader((data=traindata, label=trainlabels), batchsize=100, shuffle=true, buffer=true, parallel=true) |> gpu ;
+# testloader = Flux.DataLoader((data=testdata, label=testlabels), batchsize=100, shuffle=false, buffer=true) |> gpu ;
 
-minibatches = []
-batchsize = 100
-for i in range(1, stop = trainsize÷batchsize)
-  lbound = (i-1)*batchsize+1
-  ubound = min(trainsize, i*batchsize)
-  push!(minibatches, (traindata[:, :, :, lbound:ubound], trainlabels[:, lbound:ubound]))
-end
-
-Move data and model to gpu
-traindata = traindata |> gpu
-testdata = testdata |> gpu
-trainlabels = trainlabels |> gpu
-testlabels = testlabels |> gpu
-model = model |> gpu
-minibatches = minibatches |> gpu
+trainloader = Flux.DataLoader((data=traindata, label=trainlabels), batchsize=100) |> gpu ;
+testloader = Flux.DataLoader((data=testdata, label=testlabels), batchsize=100) |> gpu ;
 
 #Train
-@Flux.epochs 15 Flux.train!(loss, params(model), minibatches, opt, cb = Flux.throttle(TBCallback, 5))
+with_logger(logger) do
+    for epoch in 1:15
+        println("epoch $epoch")
+        for (x, y) in trainloader
+            loss, grads = Flux.withgradient(model) do m
+                pred = m(x)
+                ChainRulesCore.ignore_derivatives() do 
+                    log_train(pred, y)
+                end
+                loss_fn(pred, y)
+            end
+            Flux.update!(opt, model, grads[1])
+        end
+        Flux.throttle(log_val(), 5)
+    end
+end

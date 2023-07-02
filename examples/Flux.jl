@@ -6,8 +6,10 @@ using MLDatasets
 using Statistics
 
 #create tensorboard logger
-logdir = "content/log"
-logger = TBLogger(logdir, tb_overwrite)
+logdir = "Fluxlogs"
+image_logger = TBLogger(logdir, tb_append; prefix="image")
+train_logger = TBLogger(logdir, tb_append; prefix="train") # global_logger() # default used to check events are trying to log
+val_logger = TBLogger(logdir, tb_append; prefix="val") # global_logger()
 
 #Load data
 traindata, trainlabels = FashionMNIST.traindata();
@@ -17,7 +19,7 @@ testsize = size(testdata, 3);
 
 #Log some images
 images = TBImage(traindata[:, :, 1:10], WHN)
-with_logger(logger) do #log some samples
+with_logger(val_logger) do #log some samples
     @info "fmnist/samples" pics = images log_step_increment=0
 end
 
@@ -42,34 +44,43 @@ testlabels = Flux.onehotbatch(testlabels, collect(0:9));
 
 #functions to log information
 function log_train(pred, y)
-    @info "train" loss=loss_fn(pred, y) acc=accuracy(pred, y)
+    @info "train/vals" loss=loss_fn(pred, y) acc=accuracy(pred, y)
 end
 function log_val()
     params_vec, _ = Flux.destructure(model)
-        @info "train" model=params_vec log_step_increment=0
-    @info "test" loss=loss_fn(model(testdata), testlabels) acc=accuracy(model(testdata), testlabels)
+    @info "train/weights" model=params_vec log_step_increment=0
+    @info "test/vals" loss=loss_fn(model(testdata), testlabels) acc=accuracy(model(testdata), testlabels)
 end
 
 # trainloader = Flux.DataLoader((data=traindata, label=trainlabels), batchsize=100, shuffle=true, buffer=true, parallel=true) |> gpu ;
 # testloader = Flux.DataLoader((data=testdata, label=testlabels), batchsize=100, shuffle=false, buffer=true) |> gpu ;
 
-trainloader = Flux.DataLoader((data=traindata, label=trainlabels), batchsize=100) |> gpu ;
-testloader = Flux.DataLoader((data=testdata, label=testlabels), batchsize=100) |> gpu ;
+# trainloader = Flux.DataLoader((data=traindata, label=trainlabels), batchsize=100) |> gpu;
+# testloader = Flux.DataLoader((data=testdata, label=testlabels), batchsize=100) |> gpu;
+# simple dumb dataloader to isolate if the problem is related to the Flux.DataLoader
+function batch(data, batchsize)
+    return eachslice(reshape(data, size(data)[1:end-1]..., trunc(Int, size(data)[end]/batchsize), :); dims=ndims(data)+1)
+end
+bs100 = data -> batch(data, 100)
+trainloader = zip(bs100(traindata), bs100(trainlabels)) |> gpu;
+testloader = zip(bs100(testdata), bs100(testlabels)) |> gpu;
 
 #Train
-with_logger(logger) do
-    for epoch in 1:15
-        println("epoch $epoch")
-        for (x, y) in trainloader
-            loss, grads = Flux.withgradient(model) do m
-                pred = m(x)
-                ChainRulesCore.ignore_derivatives() do 
+for epoch in 1:15
+    println("epoch $epoch")
+    for (x, y) in trainloader
+        loss, grads = Flux.withgradient(model) do m
+            pred = m(x)
+            ChainRulesCore.ignore_derivatives() do 
+                with_logger(train_logger) do 
                     log_train(pred, y)
                 end
-                loss_fn(pred, y)
             end
-            Flux.update!(opt, model, grads[1])
+            loss_fn(pred, y)
         end
-        Flux.throttle(log_val(), 5)
+        Flux.update!(opt, model, grads[1])
+    end
+    with_logger(val_logger) do 
+        log_val()
     end
 end
